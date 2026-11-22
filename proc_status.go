@@ -105,7 +105,12 @@ func (p Proc) NewStatus() (ProcStatus, error) {
 		return ProcStatus{}, err
 	}
 
-	s := ProcStatus{PID: p.PID}
+	return parseProcStatus(data, p.PID)
+}
+
+// parseProcStatus parses the contents of a /proc/<pid>/status file.
+func parseProcStatus(data []byte, pid int) (ProcStatus, error) {
+	s := ProcStatus{PID: pid}
 
 	for line := range strings.SplitSeq(string(data), "\n") {
 		if !bytes.Contains([]byte(line), []byte(":")) {
@@ -126,8 +131,7 @@ func (p Proc) NewStatus() (ProcStatus, error) {
 		// convert kB to B
 		vBytes := vKBytes * 1024
 
-		err = s.fillStatus(k, v, vKBytes, vBytes)
-		if err != nil {
+		if err := s.fillStatus(k, v, vKBytes, vBytes); err != nil {
 			return ProcStatus{}, err
 		}
 	}

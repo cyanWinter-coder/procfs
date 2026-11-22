@@ -139,11 +139,16 @@ func (p Proc) Stat() (ProcStat, error) {
 		return ProcStat{}, err
 	}
 
+	return parseProcStat(data, p.PID, p.fs)
+}
+
+// parseProcStat parses the contents of a /proc/<pid>/stat file.
+func parseProcStat(data []byte, pid int, fs FS) (ProcStat, error) {
 	var (
 		ignoreInt64  int64
 		ignoreUint64 uint64
 
-		s = ProcStat{PID: p.PID, proc: p.fs}
+		s = ProcStat{PID: pid, proc: fs}
 		l = bytes.Index(data, []byte("("))
 		r = bytes.LastIndex(data, []byte(")"))
 	)
@@ -158,7 +163,7 @@ func (p Proc) Stat() (ProcStat, error) {
 	// fields and their data types:
 	// * https://man7.org/linux/man-pages/man5/proc.5.html
 	// * https://man7.org/linux/man-pages/man3/scanf.3.html
-	_, err = fmt.Fscan(
+	_, err := fmt.Fscan(
 		bytes.NewBuffer(data[r+2:]),
 		&s.State,
 		&s.PPID,
