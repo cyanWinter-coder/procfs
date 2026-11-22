@@ -15,6 +15,7 @@ package procfs
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -51,6 +52,16 @@ type NetUNIXFlags uint64
 // NetUNIXState is the type of the state field.
 type NetUNIXState uint64
 
+// Categories of per-line parse failures reported by the tolerant UNIX socket
+// table parser.
+const (
+	// NetUNIXErrorFieldCount means a line does not carry the expected minimum
+	// number of fields.
+	NetUNIXErrorFieldCount = "field count mismatch"
+	// NetUNIXErrorField means one of the present fields cannot be parsed.
+	NetUNIXErrorField = "malformed field"
+)
+
 // NetUNIXLine represents a line of /proc/net/unix.
 type NetUNIXLine struct {
 	KernelPtr string
@@ -68,9 +79,59 @@ type NetUNIX struct {
 	Rows []*NetUNIXLine
 }
 
+// errNetUNIXFieldCount marks a line carrying fewer fields than the parser
+// needs.
+var errNetUNIXFieldCount = errors.New("unexpected number of fields")
+
+// NetUNIXLineError describes a single line that could not be parsed.
+// Line numbers are 1-based and include the header line, matching the line
+// numbers seen when opening the kernel file directly.
+type NetUNIXLineError struct {
+	// Line is the 1-based line number within the source file.
+	Line int
+	// Category classifies the failure, see the NetUNIXError* constants.
+	Category string
+	// Err is the underlying parse error.
+	Err error
+}
+
+func (e NetUNIXLineError) Error() string {
+	return fmt.Sprintf("%s: line %d: %s: %s", ErrFileParse, e.Line, e.Category, e.Err)
+}
+
+// Unwrap exposes both the parser sentinel and the underlying line error so
+// errors.Is matches either.
+func (e NetUNIXLineError) Unwrap() []error {
+	return []error{ErrFileParse, e.Err}
+}
+
+// NetUNIXPartialResult is the tolerant parsing result of a /proc/net/unix
+// file. Valid lines are kept in Rows while every rejected line is recorded in
+// LineErrors together with its line number and failure category.
+type NetUNIXPartialResult struct {
+	// Rows contains the successfully parsed lines in kernel file order.
+	Rows []*NetUNIXLine
+	// LineErrors records the rejected lines with their line numbers.
+	LineErrors []NetUNIXLineError
+}
+
+// Complete reports whether the file was parsed without any rejected line.
+func (r NetUNIXPartialResult) Complete() bool {
+	return len(r.LineErrors) == 0
+}
+
 // NetUNIX returns data read from /proc/net/unix.
 func (fs FS) NetUNIX() (*NetUNIX, error) {
 	return readNetUNIX(fs.proc.Path("net/unix"))
+}
+
+// NetUNIXPartial returns data read from /proc/net/unix without failing on
+// individual malformed lines. Successfully parsed lines are returned in kernel
+// file order and every rejected line is reported with its line number and
+// failure category. Use the result's Complete method to check whether the whole
+// file was parsed successfully.
+func (fs FS) NetUNIXPartial() (NetUNIXPartialResult, error) {
+	return readNetUNIXPartial(fs.proc.Path("net/unix"))
 }
 
 // readNetUNIX reads data in /proc/net/unix format from the specified file.
@@ -86,8 +147,37 @@ func readNetUNIX(file string) (*NetUNIX, error) {
 	return parseNetUNIX(f)
 }
 
+// readNetUNIXPartial reads data in /proc/net/unix format from the specified
+// file, keeping valid lines and recording rejected ones instead of failing the
+// whole table.
+func readNetUNIXPartial(file string) (NetUNIXPartialResult, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return NetUNIXPartialResult{}, err
+	}
+	defer f.Close()
+
+	return parseNetUNIXPartial(f)
+}
+
 // parseNetUNIX creates a NetUnix structure from the incoming stream.
 func parseNetUNIX(r io.Reader) (*NetUNIX, error) {
+	result, err := parseNetUNIXPartial(r)
+	if err != nil {
+		return nil, err
+	}
+	if len(result.LineErrors) > 0 {
+		// Keep the historical strict contract: surface the first bad line.
+		return nil, result.LineErrors[0]
+	}
+
+	return &NetUNIX{Rows: result.Rows}, nil
+}
+
+// parseNetUNIXPartial scans the stream line by line. The scanner is local to
+// this call, so concurrent parses never share mutable state. Rows keep the
+// kernel file order.
+func parseNetUNIXPartial(r io.Reader) (NetUNIXPartialResult, error) {
 	// Begin scanning by checking for the existence of Inode.
 	s := bufio.NewScanner(r)
 	s.Scan()
@@ -103,30 +193,40 @@ func parseNetUNIX(r io.Reader) (*NetUNIX, error) {
 		minFields++
 	}
 
-	var nu NetUNIX
+	var result NetUNIXPartialResult
+	lineNo := 1 // the header line consumed above
 	for s.Scan() {
-		line := s.Text()
-		item, err := nu.parseLine(line, hasInode, minFields)
+		lineNo++
+		item, err := parseNetUNIXLine(s.Text(), hasInode, minFields)
 		if err != nil {
-			return nil, fmt.Errorf("%w: /proc/net/unix encountered data %q: %w", ErrFileParse, line, err)
+			category := NetUNIXErrorField
+			if errors.Is(err, errNetUNIXFieldCount) {
+				category = NetUNIXErrorFieldCount
+			}
+			result.LineErrors = append(result.LineErrors, NetUNIXLineError{
+				Line:     lineNo,
+				Category: category,
+				Err:      err,
+			})
+			continue
 		}
 
-		nu.Rows = append(nu.Rows, item)
+		result.Rows = append(result.Rows, item)
 	}
 
 	if err := s.Err(); err != nil {
-		return nil, fmt.Errorf("%w: /proc/net/unix encountered data: %w", ErrFileParse, err)
+		return NetUNIXPartialResult{}, fmt.Errorf("%w: /proc/net/unix encountered data: %w", ErrFileParse, err)
 	}
 
-	return &nu, nil
+	return result, nil
 }
 
-func (u *NetUNIX) parseLine(line string, hasInode bool, minFields int) (*NetUNIXLine, error) {
+func parseNetUNIXLine(line string, hasInode bool, minFields int) (*NetUNIXLine, error) {
 	fields := strings.Fields(line)
 
 	l := len(fields)
 	if l < minFields {
-		return nil, fmt.Errorf("%w: expected at least %d fields but got %d", ErrFileParse, minFields, l)
+		return nil, fmt.Errorf("%w: %w: expected at least %d fields but got %d", ErrFileParse, errNetUNIXFieldCount, minFields, l)
 	}
 
 	// Field offsets are as follows:
@@ -134,29 +234,29 @@ func (u *NetUNIX) parseLine(line string, hasInode bool, minFields int) (*NetUNIX
 
 	kernelPtr := strings.TrimSuffix(fields[0], ":")
 
-	users, err := u.parseUsers(fields[1])
+	users, err := parseNetUNIXUsers(fields[1])
 	if err != nil {
 		return nil, fmt.Errorf("%w: ref count %q: %w", ErrFileParse, fields[1], err)
 	}
 
-	flags, err := u.parseFlags(fields[3])
+	flags, err := parseNetUNIXFlags(fields[3])
 	if err != nil {
 		return nil, fmt.Errorf("%w: Unable to parse flags %q: %w", ErrFileParse, fields[3], err)
 	}
 
-	typ, err := u.parseType(fields[4])
+	typ, err := parseNetUNIXType(fields[4])
 	if err != nil {
 		return nil, fmt.Errorf("%w: Failed to parse type %q: %w", ErrFileParse, fields[4], err)
 	}
 
-	state, err := u.parseState(fields[5])
+	state, err := parseNetUNIXState(fields[5])
 	if err != nil {
 		return nil, fmt.Errorf("%w: Failed to parse state %q: %w", ErrFileParse, fields[5], err)
 	}
 
 	var inode uint64
 	if hasInode {
-		inode, err = u.parseInode(fields[6])
+		inode, err = parseNetUNIXInode(fields[6])
 		if err != nil {
 			return nil, fmt.Errorf("%w failed to parse inode %q: %w", ErrFileParse, fields[6], err)
 		}
@@ -186,11 +286,11 @@ func (u *NetUNIX) parseLine(line string, hasInode bool, minFields int) (*NetUNIX
 	return n, nil
 }
 
-func (u NetUNIX) parseUsers(s string) (uint64, error) {
+func parseNetUNIXUsers(s string) (uint64, error) {
 	return strconv.ParseUint(s, 16, 32)
 }
 
-func (u NetUNIX) parseType(s string) (NetUNIXType, error) {
+func parseNetUNIXType(s string) (NetUNIXType, error) {
 	typ, err := strconv.ParseUint(s, 16, 16)
 	if err != nil {
 		return 0, err
@@ -199,7 +299,7 @@ func (u NetUNIX) parseType(s string) (NetUNIXType, error) {
 	return NetUNIXType(typ), nil
 }
 
-func (u NetUNIX) parseFlags(s string) (NetUNIXFlags, error) {
+func parseNetUNIXFlags(s string) (NetUNIXFlags, error) {
 	flags, err := strconv.ParseUint(s, 16, 32)
 	if err != nil {
 		return 0, err
@@ -208,7 +308,7 @@ func (u NetUNIX) parseFlags(s string) (NetUNIXFlags, error) {
 	return NetUNIXFlags(flags), nil
 }
 
-func (u NetUNIX) parseState(s string) (NetUNIXState, error) {
+func parseNetUNIXState(s string) (NetUNIXState, error) {
 	st, err := strconv.ParseInt(s, 16, 8)
 	if err != nil {
 		return 0, err
@@ -217,7 +317,7 @@ func (u NetUNIX) parseState(s string) (NetUNIXState, error) {
 	return NetUNIXState(st), nil
 }
 
-func (u NetUNIX) parseInode(s string) (uint64, error) {
+func parseNetUNIXInode(s string) (uint64, error) {
 	return strconv.ParseUint(s, 10, 64)
 }
 

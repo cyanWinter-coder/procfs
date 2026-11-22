@@ -16,6 +16,7 @@ package procfs
 import (
 	"bufio"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,6 +33,19 @@ const (
 	// With e.g. 150 Byte per line and the maximum number of 65535,
 	// the reader needs to handle 150 Byte * 65535 =~ 10 MB for a single IP.
 	readLimit = 4294967296 // Byte -> 4 GiB
+)
+
+// Categories of per-line parse failures reported by the tolerant network
+// table parsers.
+const (
+	// NetIPSocketErrorFieldCount means a line does not carry the expected
+	// number of fields.
+	NetIPSocketErrorFieldCount = "field count mismatch"
+	// NetIPSocketErrorAddressFamily means an address can neither be decoded
+	// as an IPv4 nor an IPv6 address, so the address family is unknown.
+	NetIPSocketErrorAddressFamily = "unknown address family"
+	// NetIPSocketErrorField means one of the present fields cannot be parsed.
+	NetIPSocketErrorField = "malformed field"
 )
 
 // This contains generic data structures for both udp and tcp sockets.
@@ -71,71 +85,170 @@ type (
 		Inode     uint64
 		Drops     *uint64
 	}
+
+	// NetIPSocketLineError describes a single line that could not be parsed.
+	// Line numbers are 1-based and include the header line, matching the line
+	// numbers seen when opening the kernel file directly.
+	NetIPSocketLineError struct {
+		// Line is the 1-based line number within the source file.
+		Line int
+		// Category classifies the failure, see the NetIPSocketError* constants.
+		Category string
+		// Err is the underlying parse error.
+		Err error
+	}
+
+	// NetIPSocketPartialResult is the tolerant parsing result of a
+	// /proc/net/{t,u}dp{,6} file. Valid lines are kept in Rows while every
+	// rejected line is recorded in LineErrors together with its line number
+	// and failure category.
+	NetIPSocketPartialResult struct {
+		// Rows contains the successfully parsed lines in kernel file order.
+		Rows NetIPSocket
+		// LineErrors records the rejected lines with their line numbers.
+		LineErrors []NetIPSocketLineError
+	}
 )
 
+// Complete reports whether the file was parsed without any rejected line.
+func (r NetIPSocketPartialResult) Complete() bool {
+	return len(r.LineErrors) == 0
+}
+
+func (e NetIPSocketLineError) Error() string {
+	return fmt.Sprintf("%s: line %d: %s: %s", ErrFileParse, e.Line, e.Category, e.Err)
+}
+
+// Unwrap exposes both the parser sentinel and the underlying line error so
+// errors.Is matches either.
+func (e NetIPSocketLineError) Unwrap() []error {
+	return []error{ErrFileParse, e.Err}
+}
+
+// firstLineError returns the first recorded line error, or nil. It is shared by
+// the strict entry points, which keep the historical contract of failing the
+// whole table on the first bad line.
+func (r NetIPSocketPartialResult) firstLineError() error {
+	if len(r.LineErrors) == 0 {
+		return nil
+	}
+	return r.LineErrors[0]
+}
+
 func newNetIPSocket(file string) (NetIPSocket, error) {
-	f, err := os.Open(file)
+	result, err := newNetIPSocketPartial(file)
 	if err != nil {
 		return nil, err
 	}
+	if err := result.firstLineError(); err != nil {
+		return nil, err
+	}
+	return result.Rows, nil
+}
+
+// newNetIPSocketPartial parses the given file line by line. Valid lines are
+// returned together with the line numbers and categories of the rejected
+// lines instead of failing the whole table on the first bad line.
+func newNetIPSocketPartial(file string) (NetIPSocketPartialResult, error) {
+	f, err := os.Open(file)
+	if err != nil {
+		return NetIPSocketPartialResult{}, err
+	}
 	defer f.Close()
 
-	var netIPSocket NetIPSocket
-	isUDP := strings.Contains(file, "udp")
+	return parseNetIPSocket(io.LimitReader(f, readLimit), strings.Contains(file, "udp"))
+}
 
-	lr := io.LimitReader(f, readLimit)
-	s := bufio.NewScanner(lr)
+// parseNetIPSocket scans the stream of a /proc/net/{t,u}dp{,6} file. The
+// scanner and its line slice are local to this call, so concurrent parses never
+// share mutable state. Rows keep the kernel file order.
+func parseNetIPSocket(r io.Reader, isUDP bool) (NetIPSocketPartialResult, error) {
+	var result NetIPSocketPartialResult
+
+	s := bufio.NewScanner(r)
+	lineNo := 0
 	s.Scan() // skip first line with headers
+	lineNo++
 	for s.Scan() {
+		lineNo++
 		fields := strings.Fields(s.Text())
 		line, err := parseNetIPSocketLine(fields, isUDP)
 		if err != nil {
-			return nil, err
+			result.LineErrors = append(result.LineErrors, NetIPSocketLineError{
+				Line:     lineNo,
+				Category: netIPSocketErrorCategory(err),
+				Err:      err,
+			})
+			continue
 		}
-		netIPSocket = append(netIPSocket, line)
+		result.Rows = append(result.Rows, line)
 	}
 	if err := s.Err(); err != nil {
-		return nil, err
+		return NetIPSocketPartialResult{}, err
 	}
-	return netIPSocket, nil
+	return result, nil
 }
 
 // newNetIPSocketSummary creates a new NetIPSocket{,6} from the contents of the given file.
 func newNetIPSocketSummary(file string) (*NetIPSocketSummary, error) {
-	f, err := os.Open(file)
+	result, err := newNetIPSocketPartial(file)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-
-	var netIPSocketSummary NetIPSocketSummary
-	var udpPacketDrops uint64
-	isUDP := strings.Contains(file, "udp")
-
-	lr := io.LimitReader(f, readLimit)
-	s := bufio.NewScanner(lr)
-	s.Scan() // skip first line with headers
-	for s.Scan() {
-		fields := strings.Fields(s.Text())
-		line, err := parseNetIPSocketLine(fields, isUDP)
-		if err != nil {
-			return nil, err
-		}
-		netIPSocketSummary.TxQueueLength += line.TxQueue
-		netIPSocketSummary.RxQueueLength += line.RxQueue
-		netIPSocketSummary.UsedSockets++
-		if isUDP {
-			udpPacketDrops += *line.Drops
-			netIPSocketSummary.Drops = &udpPacketDrops
-		}
-	}
-	if err := s.Err(); err != nil {
+	if err := result.firstLineError(); err != nil {
 		return nil, err
 	}
-	return &netIPSocketSummary, nil
+	return summarizeNetIPSocket(result.Rows, strings.Contains(file, "udp")), nil
+}
+
+// newNetIPSocketSummaryPartial tolerates rejected lines and aggregates only the
+// successfully parsed ones. The completion state is available through the
+// returned result's Complete method.
+func newNetIPSocketSummaryPartial(file string) (*NetIPSocketSummary, NetIPSocketPartialResult, error) {
+	result, err := newNetIPSocketPartial(file)
+	if err != nil {
+		return nil, NetIPSocketPartialResult{}, err
+	}
+	return summarizeNetIPSocket(result.Rows, strings.Contains(file, "udp")), result, nil
+}
+
+func summarizeNetIPSocket(lines NetIPSocket, isUDP bool) *NetIPSocketSummary {
+	var summary NetIPSocketSummary
+	var udpPacketDrops uint64
+	for _, line := range lines {
+		summary.TxQueueLength += line.TxQueue
+		summary.RxQueueLength += line.RxQueue
+		summary.UsedSockets++
+		if isUDP {
+			udpPacketDrops += *line.Drops
+			summary.Drops = &udpPacketDrops
+		}
+	}
+	return &summary
+}
+
+// netIPSocketErrorCategory maps a line parse error to one of the
+// NetIPSocketError* categories.
+func netIPSocketErrorCategory(err error) string {
+	switch {
+	case errors.Is(err, errUnknownAddressFamily):
+		return NetIPSocketErrorAddressFamily
+	case errors.Is(err, errNetIPSocketFieldCount):
+		return NetIPSocketErrorFieldCount
+	default:
+		return NetIPSocketErrorField
+	}
 }
 
 // the /proc/net/{t,u}dp{,6} files are network byte order for ipv4 and for ipv6 the address is four words consisting of four bytes each. In each of those four words the four bytes are written in reverse order.
+
+// errUnknownAddressFamily marks an address whose decoded length is neither 4
+// nor 16 bytes, i.e. neither IPv4 nor IPv6.
+var errUnknownAddressFamily = errors.New("unknown address family")
+
+// errNetIPSocketFieldCount marks a line carrying fewer fields than the parser
+// needs.
+var errNetIPSocketFieldCount = errors.New("unexpected number of fields")
 
 func parseIP(hexIP string) (net.IP, error) {
 	var byteIP []byte
@@ -155,20 +268,31 @@ func parseIP(hexIP string) (net.IP, error) {
 		}
 		return i, nil
 	default:
-		return nil, fmt.Errorf("%w: Unable to parse IP %s: %v", ErrFileParse, hexIP, nil)
+		return nil, fmt.Errorf("%w: %w: unable to parse IP %s", ErrFileParse, errUnknownAddressFamily, hexIP)
 	}
 }
 
 // parseNetIPSocketLine parses a single line, represented by a list of fields.
+// It never returns a partially populated socket line: any failure yields a nil
+// line together with a categorized error, so callers cannot accidentally
+// consume zero-valued socket data.
 func parseNetIPSocketLine(fields []string, isUDP bool) (*netIPSocketLine, error) {
-	line := &netIPSocketLine{}
-	if len(fields) < 10 {
+	// TCP lines carry 10 required fields, UDP lines additionally carry the
+	// drops field at index 12.
+	minFields := 10
+	if isUDP {
+		minFields = 13
+	}
+	if len(fields) < minFields {
 		return nil, fmt.Errorf(
-			"%w: Less than 10 columns found %q",
+			"%w: %w: less than %d columns found %q",
 			ErrFileParse,
+			errNetIPSocketFieldCount,
+			minFields,
 			strings.Join(fields, " "),
 		)
 	}
+	line := &netIPSocketLine{}
 	var err error // parse error
 
 	// sl
