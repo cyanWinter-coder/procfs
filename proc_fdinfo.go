@@ -54,6 +54,11 @@ func (p Proc) FDInfo(fd string) (*ProcFDInfo, error) {
 		return nil, err
 	}
 
+	return parseFDInfo(fd, data)
+}
+
+// parseFDInfo parses the contents of a /proc/[pid]/fdinfo/[fd] file.
+func parseFDInfo(fd string, data []byte) (*ProcFDInfo, error) {
 	var text, pos, flags, mntid, ino string
 	var inotify []InotifyInfo
 
